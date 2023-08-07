@@ -9,6 +9,7 @@ const CONFIG = {
     // wait until a detection is made on this number of distinct frames before showing the marker
     MIN_DETECTIONS_TO_MAKE_VISIBLE: 3
 }
+INFERENCE_SERVER_URL ='' //Set yout url for requesting inference on a model server
 
 // Dependency for map rendering
 const mapboxgl = require('mapbox-gl');
@@ -188,76 +189,103 @@ var renderMap = async function(videoFile, flightLogFile) {
             // if the model has loaded, we're not already waiting for a prediction to return,
             // and it's been at least 200ms since we last ran a frame through the vision model,
             // run a video frame through our computer vision model to detect & plot solar panels
-            if(window.model && !detectionInFlight && Date.now() - lastDetection >= 200) {
+            if(!detectionInFlight && Date.now() - lastDetection >= 200) {
                 // pause the video so it doesn't get out of sync
                 detectionInFlight = true;
                 video.pause();
 
                 // run the current frame through the model
-                window.model.detect(video).then(function(predictions) {
-                    // for each solar panel detected, convert its x/y position in the video frame to a GPS coordinate
-                    _.each(predictions, function(p) {
-                        // change coordinate system so the center point of the video is (0, 0) (instead of the top-left point)
-                        // this means that (0, 0) is where our drone is and makes our math easier
-                        var normalized = [p.bbox.y - videoHeight / 2, p.bbox.x - videoWidth / 2];
+                const canvas = document.createElement('canvas')
+                canvas.width = videoWidth
+                canvas.height = videoHeight
+                const ctx = canvas.getContext('2d')
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+                image_b64 = canvas.toDataURL('image/jpeg').split(",")[1];
+                var payload = {
+                    input: {
+                        image: image_b64
+                    }
+                  };
 
-                        // calculate the distance and bearing of the solar panel relative to the center point
-                        var distanceFromCenterInPixels = Math.sqrt((videoWidth/2-p.bbox.x)*(videoWidth/2-p.bbox.x)+(videoHeight/2-p.bbox.y)*(videoHeight/2-p.bbox.y));
-                        var diagonalDistanceInPixels = Math.sqrt(videoWidth*videoWidth + videoHeight*videoHeight);
-                        var percentOfDiagonal = distanceFromCenterInPixels / diagonalDistanceInPixels;
-                        var distance = percentOfDiagonal * diagonalDistance; // in meters
+                fetch(INFERENCE_SERVER_URL, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(payload),
+                  })
+                  .then(response => response.json())
+                  .then(function(predictions) 
+                    {
+                        // for each solar panel detected, convert its x/y position in the video frame to a GPS coordinate
+                        predictions = predictions.output //Grab output data from response
+    
+                        _.each(predictions, function(p) {
+                            // change coordinate system so the center point of the video is (0, 0) (instead of the top-left point)
+                            // this means that (0, 0) is where our drone is and makes our math easier
 
-                        var angle = Math.atan(normalized[0]/(normalized[1]||0.000001)) * 180 / Math.PI;
-                        // if the detection is in the right half of the frame we need to rotate it 180 degrees
-                        if(normalized[1] >= 0) angle += 180;
-
-                        // use that distance and bearing to get the GPS location of the panel
-                        var point = turf.rhumbDestination(center, distance, (bearing + angle)%360, options);
-
-                        // combine detections that are close together so we end up with a single marker per panel
-                        // instead of clusters when a panel is detected across multiple frames of the video
-                        var duplicate = _.find(foundPoints, function(p, i) {
-                            var distanceFromPoint = turf.distance(point, p.location, {units: 'kilometers'});
-                            if(distanceFromPoint < CONFIG.MIN_SEPARATION_OF_DETECTIONS_IN_METERS/1000) {
-                                // if we have already found this panel, average the position of the new observation with
-                                // its existing position
-                                p.points.push(point.geometry.coordinates);
-                                var location = [0, 0];
-                                _.each(p.points, function(point) {
-                                    location[0] += point[0];
-                                    location[1] += point[1];
-                                });
-                                location[0] = location[0]/p.points.length;
-                                location[1] = location[1]/p.points.length;
-                                p.location = turf.point(location);
-
-                                // only show a panel if it has been detected at least twice
-                                // (this prevents noisy predictions from clogging up the map)
-                                if(!p.marker && p.points.length >= CONFIG.MIN_DETECTIONS_TO_MAKE_VISIBLE) {
-                                    var marker = new mapboxgl.Marker()
-                                        .setLngLat(location)
-                                        .addTo(map);
-
-                                    p.marker = marker;
-                                } else if(p.marker) {
-                                    // if the marker is already shown, update its position to the new average
-                                    p.marker.setLngLat(location);
+                            const yc = (p[1]+p[3])/2 // Our model returns cooridantes in a format
+                            const xc = (p[0]+p[2])/2 // [x_left, y_top, x_right, y_bottom] 
+                            var normalized = [yc - videoHeight / 2, xc - videoWidth / 2];
+    
+                            // calculate the distance and bearing of the solar panel relative to the center point
+                            var distanceFromCenterInPixels = Math.sqrt((videoWidth/2-xc)*(videoWidth/2-xc)+(videoHeight/2-yc)*(videoHeight/2-yc));
+                            var diagonalDistanceInPixels = Math.sqrt(videoWidth*videoWidth + videoHeight*videoHeight);
+                            var percentOfDiagonal = distanceFromCenterInPixels / diagonalDistanceInPixels;
+                            var distance = percentOfDiagonal * diagonalDistance; // in meters
+    
+                            var angle = Math.atan(normalized[0]/(normalized[1]||0.000001)) * 180 / Math.PI;
+                            // if the detection is in the right half of the frame we need to rotate it 180 degrees
+                            if(normalized[1] >= 0) angle += 180;
+    
+                            // use that distance and bearing to get the GPS location of the panel
+                            var point = turf.rhumbDestination(center, distance, (bearing + angle)%360, options);
+    
+                            // combine detections that are close together so we end up with a single marker per panel
+                            // instead of clusters when a panel is detected across multiple frames of the video
+                            var duplicate = _.find(foundPoints, function(p, i) {
+                                var distanceFromPoint = turf.distance(point, p.location, {units: 'kilometers'});
+                                if(distanceFromPoint < CONFIG.MIN_SEPARATION_OF_DETECTIONS_IN_METERS/1000) {
+                                    // if we have already found this panel, average the position of the new observation with
+                                    // its existing position
+                                    p.points.push(point.geometry.coordinates);
+                                    var location = [0, 0];
+                                    _.each(p.points, function(point) {
+                                        location[0] += point[0];
+                                        location[1] += point[1];
+                                    });
+                                    location[0] = location[0]/p.points.length;
+                                    location[1] = location[1]/p.points.length;
+                                    p.location = turf.point(location);
+    
+                                    // only show a panel if it has been detected at least twice
+                                    // (this prevents noisy predictions from clogging up the map)
+                                    if(!p.marker && p.points.length >= CONFIG.MIN_DETECTIONS_TO_MAKE_VISIBLE) {
+                                        var marker = new mapboxgl.Marker()
+                                            .setLngLat(location)
+                                            .addTo(map);
+    
+                                        p.marker = marker;
+                                    } else if(p.marker) {
+                                        // if the marker is already shown, update its position to the new average
+                                        p.marker.setLngLat(location);
+                                    }
+    
+                                    return true;
                                 }
-
-                                return true;
-                            }
-                        });
-
-                        // if this is a new point, save it
-                        if(!duplicate) {
-                            foundPoints.push({
-                                location: point,
-                                points: [point.geometry.coordinates],
-                                marker: null
                             });
-                        }
-                    });
-                }).finally(function() {
+    
+                            // if this is a new point, save it
+                            if(!duplicate) {
+                                foundPoints.push({
+                                    location: point,
+                                    points: [point.geometry.coordinates],
+                                    marker: null
+                                });
+                            }
+                        })
+                    })
+                    .finally(function() {
                     // then start the video playing again
                     detectionInFlight = false;
                     lastDetection = Date.now();
